@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"time"
 
 	"github.com/podushkina/taskqueue/internal/task"
@@ -45,4 +46,14 @@ func Slow(ctx context.Context, t *task.Task) (string, error) {
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
+}
+
+func Flaky(ctx context.Context, t *task.Task) (string, error) {
+	time.Sleep(500 * time.Millisecond)
+
+	if rand.Float32() < 0.5 {
+		return "", fmt.Errorf("random failure (demo retry)")
+	}
+
+	return "succeeded after retry!", nil
 }

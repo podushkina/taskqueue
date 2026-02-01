@@ -49,6 +49,7 @@ func main() {
 	pool.Register("reverse", handlers.Reverse)
 	pool.Register("sum", handlers.Sum)
 	pool.Register("slow", handlers.Slow)
+	pool.Register("flaky", handlers.Flaky)
 
 	pool.Start(ctx)
 

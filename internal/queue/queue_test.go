@@ -75,3 +75,27 @@ func TestQueue_PopEmpty(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Nil(t, tsk)
 }
+
+func TestQueue_ListAndDelete(t *testing.T) {
+	q, mr := setupTestQueue(t)
+	defer mr.Close()
+	ctx := context.Background()
+
+	t1, _ := q.Push(ctx, "echo", "1")
+	t2, _ := q.Push(ctx, "echo", "2")
+
+	list, err := q.List(ctx)
+	require.NoError(t, err)
+	assert.Len(t, list, 2)
+
+	err = q.Delete(ctx, t1.ID)
+	assert.NoError(t, err)
+
+	deletedTask, err := q.Get(ctx, t1.ID)
+	assert.NoError(t, err)
+	assert.Nil(t, deletedTask)
+
+	remainingTask, err := q.Get(ctx, t2.ID)
+	assert.NoError(t, err)
+	assert.NotNil(t, remainingTask)
+}

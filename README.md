@@ -72,11 +72,11 @@
 
 | Категория | Технология |
 |-----------|-----------|
-| Язык | Go 1.23 |
+| Язык | Go 1.22+ |
 | Брокер / БД | Redis 7 (go-redis/v9) |
 | HTTP роутер | chi v5 |
 | Конфигурация | Переменные окружения (12-Factor App) |
-| Тесты | `testing` + `httptest` |
+| Тесты | `testing` + `testify` + `miniredis` |
 | Контейнеризация | Docker, Docker Compose |
 | Логирование | `log/slog` (structured JSON) |
 

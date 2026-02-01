@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -71,4 +72,71 @@ func TestGetTask_NotFound(t *testing.T) {
 	router.ServeHTTP(rr, req)
 
 	assert.Equal(t, http.StatusNotFound, rr.Code)
+}
+
+func TestGetTask_Success(t *testing.T) {
+	q, mr := setupTestQueue(t)
+	defer mr.Close()
+	ctx := context.Background()
+
+	tsk, _ := q.Push(ctx, "echo", "test")
+
+	h := NewHandler(q)
+	router := NewRouter(h)
+
+	req, _ := http.NewRequest("GET", "/tasks/"+tsk.ID, nil)
+	rr := httptest.NewRecorder()
+
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	var response task.Task
+	json.Unmarshal(rr.Body.Bytes(), &response)
+	assert.Equal(t, tsk.ID, response.ID)
+}
+
+func TestListTasks(t *testing.T) {
+	q, mr := setupTestQueue(t)
+	defer mr.Close()
+	ctx := context.Background()
+
+	q.Push(ctx, "t1", "p1")
+	q.Push(ctx, "t2", "p2")
+
+	h := NewHandler(q)
+	router := NewRouter(h)
+
+	req, _ := http.NewRequest("GET", "/tasks", nil)
+	rr := httptest.NewRecorder()
+
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	var tasks []task.Task
+	err := json.Unmarshal(rr.Body.Bytes(), &tasks)
+	require.NoError(t, err)
+	assert.Len(t, tasks, 2)
+}
+
+func TestDeleteTask(t *testing.T) {
+	q, mr := setupTestQueue(t)
+	defer mr.Close()
+	ctx := context.Background()
+
+	tsk, _ := q.Push(ctx, "echo", "del me")
+
+	h := NewHandler(q)
+	router := NewRouter(h)
+
+	req, _ := http.NewRequest("DELETE", "/tasks/"+tsk.ID, nil)
+	rr := httptest.NewRecorder()
+
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusNoContent, rr.Code)
+
+	found, _ := q.Get(ctx, tsk.ID)
+	assert.Nil(t, found)
 }
