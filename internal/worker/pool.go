@@ -3,7 +3,9 @@ package worker
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
+	"math"
+	"os"
 	"sync"
 	"time"
 
@@ -19,13 +21,18 @@ type Pool struct {
 	count    int
 	wg       sync.WaitGroup
 	mu       sync.RWMutex
+	logger   *slog.Logger
 }
 
 func NewPool(q *queue.Queue, count int) *Pool {
+	// Настраиваем логгер: пишет JSON в консоль
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+
 	return &Pool{
 		queue:    q,
 		handlers: make(map[string]Handler),
 		count:    count,
+		logger:   logger,
 	}
 }
 
@@ -40,30 +47,29 @@ func (p *Pool) Start(ctx context.Context) {
 		p.wg.Add(1)
 		go p.worker(ctx, i)
 	}
-	log.Printf("Started %d workers", p.count)
+	p.logger.Info("Started workers", "count", p.count)
 }
 
 func (p *Pool) Stop() {
 	p.wg.Wait()
-	log.Println("All workers stopped")
+	p.logger.Info("All workers stopped")
 }
 
 func (p *Pool) worker(ctx context.Context, id int) {
 	defer p.wg.Done()
-	log.Printf("Worker %d started", id)
+	p.logger.Debug("Worker started", "worker_id", id)
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("Worker %d shutting down", id)
 			return
 		default:
-			t, err := p.queue.Pop(ctx, 2*time.Second)
+			// Ждем задачу 1 секунду, если нет — пробуем снова
+			t, err := p.queue.Pop(ctx, 1*time.Second)
 			if err != nil {
-				if ctx.Err() != nil {
-					return
+				if ctx.Err() == nil {
+					p.logger.Error("Pop error", "worker_id", id, "error", err)
 				}
-				log.Printf("Worker %d: pop error: %v", id, err)
 				continue
 			}
 
@@ -77,36 +83,59 @@ func (p *Pool) worker(ctx context.Context, id int) {
 }
 
 func (p *Pool) process(ctx context.Context, workerID int, t *task.Task) {
-	log.Printf("Worker %d processing task %s (type: %s)", workerID, t.ID, t.Type)
+	// Создаем логгер с контекстом задачи (чтобы видеть ID задачи в логах)
+	log := p.logger.With("worker_id", workerID, "task_id", t.ID, "type", t.Type)
+	log.Info("Processing task")
 
 	t.Status = task.StatusProcessing
 	if err := p.queue.Update(ctx, t); err != nil {
-		log.Printf("Worker %d: update status error: %v", workerID, err)
+		log.Error("Failed to update status", "error", err)
 	}
 
 	p.mu.RLock()
 	handler, ok := p.handlers[t.Type]
 	p.mu.RUnlock()
 
+	// Если не нашли обработчик для такого типа задач
 	if !ok {
 		t.Status = task.StatusFailed
 		t.Error = fmt.Sprintf("unknown task type: %s", t.Type)
 		p.queue.Update(ctx, t)
+		log.Error("Unknown task type")
 		return
 	}
 
+	// Выполняем задачу
 	result, err := handler(ctx, t)
+
 	if err != nil {
-		t.Status = task.StatusFailed
-		t.Error = err.Error()
-		log.Printf("Worker %d: task %s failed: %v", workerID, t.ID, err)
+		// RETRY
+		if t.Retries < t.MaxRetry {
+			// Считаем время ожидания: 2 в степени попыток (1с, 2с, 4с...)
+			backoff := time.Duration(math.Pow(2, float64(t.Retries))) * time.Second
+
+			log.Warn("Task failed, retrying", "attempt", t.Retries+1, "backoff", backoff, "error", err)
+
+			// Запускаем таймер в фоне, чтобы не блокировать воркера
+			go func() {
+				time.Sleep(backoff)
+				// Возвращаем в очередь
+				if err := p.queue.Retry(context.Background(), t); err != nil {
+					p.logger.Error("Failed to retry task", "task_id", t.ID, "error", err)
+				}
+			}()
+		} else {
+			// Попытки кончились — фейлим окончательно
+			t.Status = task.StatusFailed
+			t.Error = err.Error()
+			p.queue.Update(ctx, t)
+			log.Error("Task failed permanently", "error", err)
+		}
 	} else {
+		// Успех
 		t.Status = task.StatusCompleted
 		t.Result = result
-		log.Printf("Worker %d: task %s completed", workerID, t.ID)
-	}
-
-	if err := p.queue.Update(ctx, t); err != nil {
-		log.Printf("Worker %d: update result error: %v", workerID, err)
+		p.queue.Update(ctx, t)
+		log.Info("Task completed")
 	}
 }

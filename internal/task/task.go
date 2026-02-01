@@ -13,6 +13,8 @@ const (
 	StatusFailed     Status = "failed"
 )
 
+const DefaultMaxRetry = 3
+
 type Task struct {
 	ID        string    `json:"id"`
 	Type      string    `json:"type"`
@@ -20,6 +22,8 @@ type Task struct {
 	Status    Status    `json:"status"`
 	Result    string    `json:"result,omitempty"`
 	Error     string    `json:"error,omitempty"`
+	Retries   int       `json:"retries"`
+	MaxRetry  int       `json:"max_retry"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }

@@ -1,0 +1,19 @@
+# Binaries
+/bin/
+/dist/
+main
+taskqueue
+
+# Mac OS junk
+.DS_Store
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+
+# Environment variables (секреты)
+.env
+
+# Vendor (если используешь)
+vendor/

@@ -47,6 +47,7 @@ func (q *Queue) Push(ctx context.Context, taskType, payload string) (*task.Task,
 		Type:      taskType,
 		Payload:   payload,
 		Status:    task.StatusPending,
+		MaxRetry:  task.DefaultMaxRetry, // ← НОВОЕ: максимум 3 попытки
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 	}
@@ -65,6 +66,28 @@ func (q *Queue) Push(ctx context.Context, taskType, payload string) (*task.Task,
 	}
 
 	return t, nil
+}
+
+// Retry кладёт задачу обратно в очередь для повторной обработки.
+func (q *Queue) Retry(ctx context.Context, t *task.Task) error {
+	t.Retries++
+	t.Status = task.StatusPending
+	t.UpdatedAt = time.Now()
+
+	data, err := json.Marshal(t)
+	if err != nil {
+		return fmt.Errorf("marshal task: %w", err)
+	}
+
+	pipe := q.client.Pipeline()
+	pipe.Set(ctx, taskPrefix+t.ID, data, 24*time.Hour)
+	pipe.RPush(ctx, queueKey, t.ID)
+
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("retry task: %w", err)
+	}
+
+	return nil
 }
 
 func (q *Queue) Pop(ctx context.Context, timeout time.Duration) (*task.Task, error) {
