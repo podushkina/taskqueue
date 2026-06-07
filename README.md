@@ -92,7 +92,7 @@
 
 ## ⚡ Быстрый старт
 
-### Docker Compose (рекомендуется)
+### Docker Compose 
 
 ```bash
 git clone [https://github.com/podushkina/taskqueue.git](https://github.com/podushkina/taskqueue.git)
