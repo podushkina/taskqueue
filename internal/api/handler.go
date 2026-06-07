@@ -1,18 +1,27 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/podushkina/taskqueue/internal/queue"
+	"github.com/podushkina/taskqueue/internal/model"
 )
 
-type Handler struct {
-	queue *queue.Queue
+// Уникальный интерфейс для API — только методы для веб-ручек
+type TaskEnqueuer interface {
+	Push(ctx context.Context, taskType, payload string) (*model.Task, error)
+	Get(ctx context.Context, id string) (*model.Task, error)
+	List(ctx context.Context) ([]*model.Task, error)
+	Delete(ctx context.Context, id string) error
 }
 
-func NewHandler(q *queue.Queue) *Handler {
+type Handler struct {
+	queue TaskEnqueuer
+}
+
+func NewHandler(q TaskEnqueuer) *Handler {
 	return &Handler{queue: q}
 }
 

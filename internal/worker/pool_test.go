@@ -6,77 +6,180 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alicebob/miniredis/v2"
-	"github.com/podushkina/taskqueue/internal/queue"
-	"github.com/podushkina/taskqueue/internal/task"
+	"github.com/podushkina/taskqueue/internal/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func setupTest(t *testing.T) (*Pool, *queue.Queue, *miniredis.Miniredis) {
-	mr, err := miniredis.Run()
-	if err != nil {
-		t.Fatalf("failed to start miniredis: %v", err)
-	}
-
-	q, err := queue.New(mr.Addr(), "", 0)
-	if err != nil {
-		t.Fatalf("failed to create queue: %v", err)
-	}
-
-	pool := NewPool(q, 1)
-	return pool, q, mr
+type mockConsumer struct {
+	updatedTask *model.Task
+	retryCalled bool
+	errOnUpdate error
 }
 
-func TestPool_ProcessSuccess(t *testing.T) {
-	pool, q, mr := setupTest(t)
-	defer mr.Close()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+func (m *mockConsumer) Pop(ctx context.Context, timeout time.Duration) (*model.Task, error) {
+	return nil, nil
+}
 
-	pool.Register("success_task", func(ctx context.Context, t *task.Task) (string, error) {
-		return "ok result", nil
+func (m *mockConsumer) Update(ctx context.Context, t *model.Task) error {
+	if m.errOnUpdate != nil {
+		return m.errOnUpdate
+	}
+	m.updatedTask = t
+	return nil
+}
+
+func (m *mockConsumer) Retry(ctx context.Context, t *model.Task) error {
+	m.retryCalled = true
+	return nil
+}
+
+type mockHistory struct {
+	saved         bool
+	errOnSave     error
+	savedWithTask *model.Task
+}
+
+func (m *mockHistory) SaveHistory(ctx context.Context, t *model.Task) error {
+	if m.errOnSave != nil {
+		return m.errOnSave
+	}
+	m.saved = true
+	m.savedWithTask = t
+	return nil
+}
+
+func TestPool_Process_Success(t *testing.T) {
+	mc := &mockConsumer{}
+	mh := &mockHistory{}
+	pool := NewPool(mc, mh, 1)
+
+	pool.Register("success_task", func(ctx context.Context, t *model.Task) (string, error) {
+		return "computed data", nil
 	})
 
-	tsk, err := q.Push(ctx, "success_task", "payload")
-	require.NoError(t, err)
+	tsk := &model.Task{ID: "1", Type: "success_task", Status: model.StatusPending, MaxRetry: 3}
+	pool.process(context.Background(), 1, tsk)
+
+	require.NotNil(t, mc.updatedTask)
+	assert.Equal(t, model.StatusCompleted, mc.updatedTask.Status)
+	assert.Equal(t, "computed data", mc.updatedTask.Result)
+	assert.True(t, mh.saved)
+}
+
+func TestPool_Process_UnknownTaskType(t *testing.T) {
+	mc := &mockConsumer{}
+	mh := &mockHistory{}
+	pool := NewPool(mc, mh, 1)
+
+	tsk := &model.Task{ID: "2", Type: "ghost_task", Status: model.StatusPending}
+	pool.process(context.Background(), 1, tsk)
+
+	assert.Equal(t, model.StatusFailed, mc.updatedTask.Status)
+	assert.Contains(t, mc.updatedTask.Error, "unknown task type")
+	assert.True(t, mh.saved)
+}
+
+func TestPool_Process_HandlerError_WithRetry(t *testing.T) {
+	mc := &mockConsumer{}
+	mh := &mockHistory{}
+	pool := NewPool(mc, mh, 1)
+
+	pool.Register("retry_task", func(ctx context.Context, t *model.Task) (string, error) {
+		return "", errors.New("temporary error")
+	})
+
+	tsk := &model.Task{ID: "3", Type: "retry_task", Status: model.StatusPending, Retries: 0, MaxRetry: 3}
+	pool.process(context.Background(), 1, tsk)
+
+	time.Sleep(1050 * time.Millisecond)
+
+	assert.True(t, mc.retryCalled)
+}
+
+func TestPool_Process_HandlerError_MaxRetryReached(t *testing.T) {
+	mc := &mockConsumer{}
+	mh := &mockHistory{}
+	pool := NewPool(mc, mh, 1)
+
+	pool.Register("dead_task", func(ctx context.Context, t *model.Task) (string, error) {
+		return "", errors.New("fatal error")
+	})
+
+	tsk := &model.Task{ID: "4", Type: "dead_task", Status: model.StatusPending, Retries: 3, MaxRetry: 3}
+	pool.process(context.Background(), 1, tsk)
+
+	assert.False(t, mc.retryCalled)
+	assert.Equal(t, model.StatusFailed, mc.updatedTask.Status)
+	assert.Equal(t, "fatal error", mc.updatedTask.Error)
+	assert.True(t, mh.saved)
+}
+
+func TestPool_Process_QueueUpdateError(t *testing.T) {
+	mc := &mockConsumer{errOnUpdate: errors.New("redis down")}
+	mh := &mockHistory{}
+	pool := NewPool(mc, mh, 1)
+
+	pool.Register("task", func(ctx context.Context, t *model.Task) (string, error) {
+		return "ok", nil
+	})
+
+	tsk := &model.Task{ID: "5", Type: "task", Status: model.StatusPending}
+	assert.NotPanics(t, func() {
+		pool.process(context.Background(), 1, tsk)
+	})
+}
+
+func TestPool_Process_HistorySaveError(t *testing.T) {
+	mc := &mockConsumer{}
+	mh := &mockHistory{errOnSave: errors.New("postgres down")}
+	pool := NewPool(mc, mh, 1)
+
+	pool.Register("task", func(ctx context.Context, t *model.Task) (string, error) {
+		return "ok", nil
+	})
+
+	tsk := &model.Task{ID: "6", Type: "task", Status: model.StatusPending}
+	assert.NotPanics(t, func() {
+		pool.process(context.Background(), 1, tsk)
+	})
+}
+
+func TestPool_Register_ThreadSafety(t *testing.T) {
+	pool := NewPool(&mockConsumer{}, &mockHistory{}, 1)
+	h := func(ctx context.Context, t *model.Task) (string, error) { return "", nil }
+
+	go pool.Register("t1", h)
+	go pool.Register("t2", h)
+
+	time.Sleep(50 * time.Millisecond)
+	pool.mu.RLock()
+	defer pool.mu.RUnlock()
+	assert.NotNil(t, pool.handlers["t1"])
+	assert.NotNil(t, pool.handlers["t2"])
+}
+
+func TestPool_GracefulShutdown(t *testing.T) {
+	mc := &mockConsumer{}
+	mh := &mockHistory{}
+	pool := NewPool(mc, mh, 2)
+
+	ctx, cancel := context.WithCancel(context.Background())
 
 	pool.Start(ctx)
 
-	time.Sleep(200 * time.Millisecond)
-
-	updatedTask, err := q.Get(ctx, tsk.ID)
-	require.NoError(t, err)
-
-	assert.Equal(t, task.StatusCompleted, updatedTask.Status)
-	assert.Equal(t, "ok result", updatedTask.Result)
-}
-
-func TestPool_RetryLogic(t *testing.T) {
-	pool, q, mr := setupTest(t)
-	defer mr.Close()
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	pool.Register("fail_task", func(ctx context.Context, t *task.Task) (string, error) {
-		return "", errors.New("something went wrong")
-	})
-
-	tsk, err := q.Push(ctx, "fail_task", "payload")
-	require.NoError(t, err)
-
-	pool.Start(ctx)
-
-	time.Sleep(100 * time.Millisecond)
-
+	time.Sleep(50 * time.Millisecond)
 	cancel()
-	pool.Stop()
 
-	time.Sleep(1100 * time.Millisecond)
+	shutdownDone := make(chan struct{})
+	go func() {
+		pool.Stop()
+		close(shutdownDone)
+	}()
 
-	updatedTask, err := q.Get(context.Background(), tsk.ID)
-	require.NoError(t, err)
-
-	assert.Equal(t, task.StatusPending, updatedTask.Status)
-	assert.Equal(t, 1, updatedTask.Retries)
+	select {
+	case <-shutdownDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Pool.Stop() hung, workers did not stop gracefully")
+	}
 }

@@ -9,14 +9,24 @@ import (
 	"sync"
 	"time"
 
-	"github.com/podushkina/taskqueue/internal/queue"
-	"github.com/podushkina/taskqueue/internal/task"
+	"github.com/podushkina/taskqueue/internal/model"
 )
 
-type Handler func(ctx context.Context, t *task.Task) (string, error)
+type TaskConsumer interface {
+	Pop(ctx context.Context, timeout time.Duration) (*model.Task, error)
+	Update(ctx context.Context, t *model.Task) error
+	Retry(ctx context.Context, t *model.Task) error
+}
+
+type HistoryRepository interface {
+	SaveHistory(ctx context.Context, t *model.Task) error
+}
+
+type Handler func(ctx context.Context, t *model.Task) (string, error)
 
 type Pool struct {
-	queue    *queue.Queue
+	queue    TaskConsumer
+	repo     HistoryRepository
 	handlers map[string]Handler
 	count    int
 	wg       sync.WaitGroup
@@ -24,12 +34,12 @@ type Pool struct {
 	logger   *slog.Logger
 }
 
-func NewPool(q *queue.Queue, count int) *Pool {
-	// Настраиваем логгер: пишет JSON в консоль
+func NewPool(q TaskConsumer, repo HistoryRepository, count int) *Pool {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
 	return &Pool{
 		queue:    q,
+		repo:     repo,
 		handlers: make(map[string]Handler),
 		count:    count,
 		logger:   logger,
@@ -64,7 +74,6 @@ func (p *Pool) worker(ctx context.Context, id int) {
 		case <-ctx.Done():
 			return
 		default:
-			// Ждем задачу 1 секунду, если нет — пробуем снова
 			t, err := p.queue.Pop(ctx, 1*time.Second)
 			if err != nil {
 				if ctx.Err() == nil {
@@ -77,17 +86,18 @@ func (p *Pool) worker(ctx context.Context, id int) {
 				continue
 			}
 
-			p.process(ctx, id, t)
+			processCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			p.process(processCtx, id, t)
+			cancel()
 		}
 	}
 }
 
-func (p *Pool) process(ctx context.Context, workerID int, t *task.Task) {
-	// Создаем логгер с контекстом задачи (чтобы видеть ID задачи в логах)
+func (p *Pool) process(ctx context.Context, workerID int, t *model.Task) {
 	log := p.logger.With("worker_id", workerID, "task_id", t.ID, "type", t.Type)
 	log.Info("Processing task")
 
-	t.Status = task.StatusProcessing
+	t.Status = model.StatusProcessing
 	if err := p.queue.Update(ctx, t); err != nil {
 		log.Error("Failed to update status", "error", err)
 	}
@@ -96,46 +106,47 @@ func (p *Pool) process(ctx context.Context, workerID int, t *task.Task) {
 	handler, ok := p.handlers[t.Type]
 	p.mu.RUnlock()
 
-	// Если не нашли обработчик для такого типа задач
 	if !ok {
-		t.Status = task.StatusFailed
+		t.Status = model.StatusFailed
 		t.Error = fmt.Sprintf("unknown task type: %s", t.Type)
-		p.queue.Update(ctx, t)
+		_ = p.queue.Update(ctx, t)
+		if err := p.repo.SaveHistory(ctx, t); err != nil {
+			log.Error("Failed to save history", "error", err)
+		}
 		log.Error("Unknown task type")
 		return
 	}
 
-	// Выполняем задачу
 	result, err := handler(ctx, t)
 
 	if err != nil {
-		// RETRY
 		if t.Retries < t.MaxRetry {
-			// Считаем время ожидания: 2 в степени попыток (1с, 2с, 4с...)
 			backoff := time.Duration(math.Pow(2, float64(t.Retries))) * time.Second
 
 			log.Warn("Task failed, retrying", "attempt", t.Retries+1, "backoff", backoff, "error", err)
 
-			// Запускаем таймер в фоне, чтобы не блокировать воркера
 			go func() {
 				time.Sleep(backoff)
-				// Возвращаем в очередь
 				if err := p.queue.Retry(context.Background(), t); err != nil {
 					p.logger.Error("Failed to retry task", "task_id", t.ID, "error", err)
 				}
 			}()
 		} else {
-			// Попытки кончились — фейлим окончательно
-			t.Status = task.StatusFailed
+			t.Status = model.StatusFailed
 			t.Error = err.Error()
-			p.queue.Update(ctx, t)
+			_ = p.queue.Update(ctx, t)
+			if err := p.repo.SaveHistory(ctx, t); err != nil {
+				log.Error("Failed to save history", "error", err)
+			}
 			log.Error("Task failed permanently", "error", err)
 		}
 	} else {
-		// Успех
-		t.Status = task.StatusCompleted
+		t.Status = model.StatusCompleted
 		t.Result = result
-		p.queue.Update(ctx, t)
+		_ = p.queue.Update(ctx, t)
+		if err := p.repo.SaveHistory(ctx, t); err != nil {
+			log.Error("Failed to save history", "error", err)
+		}
 		log.Info("Task completed")
 	}
 }

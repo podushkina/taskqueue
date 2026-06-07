@@ -4,139 +4,221 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
-	"github.com/alicebob/miniredis/v2"
-	"github.com/podushkina/taskqueue/internal/queue"
-	"github.com/podushkina/taskqueue/internal/task"
+	"github.com/go-chi/chi/v5"
+	"github.com/podushkina/taskqueue/internal/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func setupTestQueue(t *testing.T) (*queue.Queue, *miniredis.Miniredis) {
-	mr, err := miniredis.Run()
-	if err != nil {
-		t.Fatalf("failed to start miniredis: %v", err)
-	}
-
-	q, err := queue.New(mr.Addr(), "", 0)
-	if err != nil {
-		t.Fatalf("failed to create queue: %v", err)
-	}
-	return q, mr
+type mockFullEnqueuer struct {
+	tasks      map[string]*model.Task
+	errToThrow error
 }
 
-func TestCreateTask(t *testing.T) {
-	q, mr := setupTestQueue(t)
-	defer mr.Close()
-
-	h := NewHandler(q)
-	router := NewRouter(h)
-
-	payload := map[string]string{
-		"type":    "echo",
-		"payload": "hello api",
+func (m *mockFullEnqueuer) Push(ctx context.Context, taskType, payload string) (*model.Task, error) {
+	if m.errToThrow != nil {
+		return nil, m.errToThrow
 	}
-	body, _ := json.Marshal(payload)
+	t := &model.Task{ID: "generated-id", Type: taskType, Payload: payload, Status: model.StatusPending}
+	m.tasks["generated-id"] = t
+	return t, nil
+}
 
+func (m *mockFullEnqueuer) Get(ctx context.Context, id string) (*model.Task, error) {
+	if m.errToThrow != nil {
+		return nil, m.errToThrow
+	}
+	return m.tasks[id], nil
+}
+
+func (m *mockFullEnqueuer) List(ctx context.Context) ([]*model.Task, error) {
+	if m.errToThrow != nil {
+		return nil, m.errToThrow
+	}
+	var list []*model.Task
+	for _, t := range m.tasks {
+		list = append(list, t)
+	}
+	return list, nil
+}
+
+func (m *mockFullEnqueuer) Delete(ctx context.Context, id string) error {
+	if m.errToThrow != nil {
+		return m.errToThrow
+	}
+	delete(m.tasks, id)
+	return nil
+}
+
+func TestCreateTask_Success(t *testing.T) {
+	me := &mockFullEnqueuer{tasks: make(map[string]*model.Task)}
+	h := NewHandler(me)
+
+	body, _ := json.Marshal(map[string]string{"type": "echo", "payload": "test"})
 	req, _ := http.NewRequest("POST", "/tasks", bytes.NewBuffer(body))
-	req.Header.Set("Content-Type", "application/json")
-
 	rr := httptest.NewRecorder()
 
-	router.ServeHTTP(rr, req)
+	h.CreateTask(rr, req)
 
 	assert.Equal(t, http.StatusCreated, rr.Code)
-
-	var response task.Task
-	err := json.Unmarshal(rr.Body.Bytes(), &response)
+	var res model.Task
+	err := json.Unmarshal(rr.Body.Bytes(), &res)
 	require.NoError(t, err)
+	assert.NotEmpty(t, res.ID)
+	assert.Equal(t, "echo", res.Type)
+}
 
-	assert.NotEmpty(t, response.ID)
-	assert.Equal(t, "echo", response.Type)
-	assert.Equal(t, "hello api", response.Payload)
+func TestCreateTask_MissingType(t *testing.T) {
+	me := &mockFullEnqueuer{tasks: make(map[string]*model.Task)}
+	h := NewHandler(me)
+
+	body, _ := json.Marshal(map[string]string{"payload": "test"})
+	req, _ := http.NewRequest("POST", "/tasks", bytes.NewBuffer(body))
+	rr := httptest.NewRecorder()
+
+	h.CreateTask(rr, req)
+
+	assert.Equal(t, http.StatusBadRequest, rr.Code)
+}
+
+func TestCreateTask_InvalidJSON(t *testing.T) {
+	me := &mockFullEnqueuer{tasks: make(map[string]*model.Task)}
+	h := NewHandler(me)
+
+	req, _ := http.NewRequest("POST", "/tasks", bytes.NewBuffer([]byte(`{"type":`)))
+	rr := httptest.NewRecorder()
+
+	h.CreateTask(rr, req)
+
+	assert.Equal(t, http.StatusBadRequest, rr.Code)
+}
+
+func TestCreateTask_QueueError(t *testing.T) {
+	me := &mockFullEnqueuer{tasks: make(map[string]*model.Task), errToThrow: errors.New("redis err")}
+	h := NewHandler(me)
+
+	body, _ := json.Marshal(map[string]string{"type": "echo", "payload": "test"})
+	req, _ := http.NewRequest("POST", "/tasks", bytes.NewBuffer(body))
+	rr := httptest.NewRecorder()
+
+	h.CreateTask(rr, req)
+
+	assert.Equal(t, http.StatusInternalServerError, rr.Code)
+}
+
+func TestGetTask_Success(t *testing.T) {
+	me := &mockFullEnqueuer{tasks: map[string]*model.Task{
+		"111": {ID: "111", Type: "echo", Status: model.StatusPending},
+	}}
+	h := NewHandler(me)
+
+	req, _ := http.NewRequest("GET", "/tasks/111", nil)
+	chiCtx := chi.NewRouteContext()
+	chiCtx.URLParams.Add("id", "111")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, chiCtx))
+	rr := httptest.NewRecorder()
+
+	h.GetTask(rr, req)
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+	var res model.Task
+	json.Unmarshal(rr.Body.Bytes(), &res)
+	assert.Equal(t, "111", res.ID)
 }
 
 func TestGetTask_NotFound(t *testing.T) {
-	q, mr := setupTestQueue(t)
-	defer mr.Close()
+	me := &mockFullEnqueuer{tasks: make(map[string]*model.Task)}
+	h := NewHandler(me)
 
-	h := NewHandler(q)
-	router := NewRouter(h)
-
-	req, _ := http.NewRequest("GET", "/tasks/non-existent-id", nil)
+	req, _ := http.NewRequest("GET", "/tasks/999", nil)
+	chiCtx := chi.NewRouteContext()
+	chiCtx.URLParams.Add("id", "999")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, chiCtx))
 	rr := httptest.NewRecorder()
 
-	router.ServeHTTP(rr, req)
+	h.GetTask(rr, req)
 
 	assert.Equal(t, http.StatusNotFound, rr.Code)
 }
 
-func TestGetTask_Success(t *testing.T) {
-	q, mr := setupTestQueue(t)
-	defer mr.Close()
-	ctx := context.Background()
+func TestGetTask_QueueError(t *testing.T) {
+	me := &mockFullEnqueuer{tasks: make(map[string]*model.Task), errToThrow: errors.New("err")}
+	h := NewHandler(me)
 
-	tsk, _ := q.Push(ctx, "echo", "test")
-
-	h := NewHandler(q)
-	router := NewRouter(h)
-
-	req, _ := http.NewRequest("GET", "/tasks/"+tsk.ID, nil)
+	req, _ := http.NewRequest("GET", "/tasks/111", nil)
+	chiCtx := chi.NewRouteContext()
+	chiCtx.URLParams.Add("id", "111")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, chiCtx))
 	rr := httptest.NewRecorder()
 
-	router.ServeHTTP(rr, req)
+	h.GetTask(rr, req)
 
-	assert.Equal(t, http.StatusOK, rr.Code)
-
-	var response task.Task
-	json.Unmarshal(rr.Body.Bytes(), &response)
-	assert.Equal(t, tsk.ID, response.ID)
+	assert.Equal(t, http.StatusInternalServerError, rr.Code)
 }
 
-func TestListTasks(t *testing.T) {
-	q, mr := setupTestQueue(t)
-	defer mr.Close()
-	ctx := context.Background()
-
-	q.Push(ctx, "t1", "p1")
-	q.Push(ctx, "t2", "p2")
-
-	h := NewHandler(q)
-	router := NewRouter(h)
+func TestListTasks_Success(t *testing.T) {
+	me := &mockFullEnqueuer{tasks: map[string]*model.Task{
+		"1": {ID: "1"},
+		"2": {ID: "2"},
+	}}
+	h := NewHandler(me)
 
 	req, _ := http.NewRequest("GET", "/tasks", nil)
 	rr := httptest.NewRecorder()
 
-	router.ServeHTTP(rr, req)
+	h.ListTasks(rr, req)
 
 	assert.Equal(t, http.StatusOK, rr.Code)
-
-	var tasks []task.Task
-	err := json.Unmarshal(rr.Body.Bytes(), &tasks)
-	require.NoError(t, err)
-	assert.Len(t, tasks, 2)
+	var res []model.Task
+	json.Unmarshal(rr.Body.Bytes(), &res)
+	assert.Len(t, res, 2)
 }
 
-func TestDeleteTask(t *testing.T) {
-	q, mr := setupTestQueue(t)
-	defer mr.Close()
-	ctx := context.Background()
+func TestDeleteTask_Success(t *testing.T) {
+	me := &mockFullEnqueuer{tasks: map[string]*model.Task{
+		"del": {ID: "del"},
+	}}
+	h := NewHandler(me)
 
-	tsk, _ := q.Push(ctx, "echo", "del me")
-
-	h := NewHandler(q)
-	router := NewRouter(h)
-
-	req, _ := http.NewRequest("DELETE", "/tasks/"+tsk.ID, nil)
+	req, _ := http.NewRequest("DELETE", "/tasks/del", nil)
+	chiCtx := chi.NewRouteContext()
+	chiCtx.URLParams.Add("id", "del")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, chiCtx))
 	rr := httptest.NewRecorder()
 
-	router.ServeHTTP(rr, req)
+	h.DeleteTask(rr, req)
 
 	assert.Equal(t, http.StatusNoContent, rr.Code)
+	assert.Nil(t, me.tasks["del"])
+}
 
-	found, _ := q.Get(ctx, tsk.ID)
-	assert.Nil(t, found)
+func TestDeleteTask_NotFound(t *testing.T) {
+	me := &mockFullEnqueuer{tasks: make(map[string]*model.Task)}
+	h := NewHandler(me)
+
+	req, _ := http.NewRequest("DELETE", "/tasks/999", nil)
+	chiCtx := chi.NewRouteContext()
+	chiCtx.URLParams.Add("id", "999")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, chiCtx))
+	rr := httptest.NewRecorder()
+
+	h.DeleteTask(rr, req)
+
+	assert.Equal(t, http.StatusNotFound, rr.Code)
+}
+
+func TestHealthCheck(t *testing.T) {
+	h := NewHandler(&mockFullEnqueuer{})
+	req, _ := http.NewRequest("GET", "/health", nil)
+	rr := httptest.NewRecorder()
+
+	h.HealthCheck(rr, req)
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+	assert.JSONEq(t, `{"status":"ok"}`, rr.Body.String())
 }

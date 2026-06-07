@@ -1,4 +1,4 @@
-package handlers
+package worker
 
 import (
 	"context"
@@ -7,15 +7,15 @@ import (
 	"math/rand/v2"
 	"time"
 
-	"github.com/podushkina/taskqueue/internal/task"
+	"github.com/podushkina/taskqueue/internal/model"
 )
 
-func Echo(ctx context.Context, t *task.Task) (string, error) {
+func Echo(ctx context.Context, t *model.Task) (string, error) {
 	time.Sleep(1 * time.Second)
 	return fmt.Sprintf("echo: %s", t.Payload), nil
 }
 
-func Reverse(ctx context.Context, t *task.Task) (string, error) {
+func Reverse(ctx context.Context, t *model.Task) (string, error) {
 	time.Sleep(500 * time.Millisecond)
 	runes := []rune(t.Payload)
 	for i, j := 0, len(runes)-1; i < j; i, j = i+1, j-1 {
@@ -24,7 +24,7 @@ func Reverse(ctx context.Context, t *task.Task) (string, error) {
 	return string(runes), nil
 }
 
-func Sum(ctx context.Context, t *task.Task) (string, error) {
+func Sum(ctx context.Context, t *model.Task) (string, error) {
 	var numbers []float64
 	if err := json.Unmarshal([]byte(t.Payload), &numbers); err != nil {
 		return "", fmt.Errorf("invalid payload: expected JSON array of numbers")
@@ -39,7 +39,7 @@ func Sum(ctx context.Context, t *task.Task) (string, error) {
 	return fmt.Sprintf("%.2f", sum), nil
 }
 
-func Slow(ctx context.Context, t *task.Task) (string, error) {
+func Slow(ctx context.Context, t *model.Task) (string, error) {
 	select {
 	case <-time.After(5 * time.Second):
 		return "completed after 5 seconds", nil
@@ -48,7 +48,7 @@ func Slow(ctx context.Context, t *task.Task) (string, error) {
 	}
 }
 
-func Flaky(ctx context.Context, t *task.Task) (string, error) {
+func Flaky(ctx context.Context, t *model.Task) (string, error) {
 	time.Sleep(500 * time.Millisecond)
 
 	if rand.Float32() < 0.5 {
