@@ -1,4 +1,4 @@
-package queue
+package repository
 
 import (
 	"context"
@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/podushkina/taskqueue/internal/task"
+	"github.com/podushkina/taskqueue/internal/model"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -16,11 +16,11 @@ const (
 	taskPrefix = "taskqueue:task:"
 )
 
-type Queue struct {
+type RedisQueue struct {
 	client *redis.Client
 }
 
-func New(addr, password string, db int) (*Queue, error) {
+func NewRedisQueue(addr, password string, db int) (*RedisQueue, error) {
 	client := redis.NewClient(&redis.Options{
 		Addr:     addr,
 		Password: password,
@@ -34,20 +34,20 @@ func New(addr, password string, db int) (*Queue, error) {
 		return nil, fmt.Errorf("redis connection failed: %w", err)
 	}
 
-	return &Queue{client: client}, nil
+	return &RedisQueue{client: client}, nil
 }
 
-func (q *Queue) Close() error {
+func (q *RedisQueue) Close() error {
 	return q.client.Close()
 }
 
-func (q *Queue) Push(ctx context.Context, taskType, payload string) (*task.Task, error) {
-	t := &task.Task{
+func (q *RedisQueue) Push(ctx context.Context, taskType, payload string) (*model.Task, error) {
+	t := &model.Task{
 		ID:        uuid.New().String(),
 		Type:      taskType,
 		Payload:   payload,
-		Status:    task.StatusPending,
-		MaxRetry:  task.DefaultMaxRetry, // ← НОВОЕ: максимум 3 попытки
+		Status:    model.StatusPending,
+		MaxRetry:  model.DefaultMaxRetry,
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 	}
@@ -68,10 +68,9 @@ func (q *Queue) Push(ctx context.Context, taskType, payload string) (*task.Task,
 	return t, nil
 }
 
-// Retry кладёт задачу обратно в очередь для повторной обработки.
-func (q *Queue) Retry(ctx context.Context, t *task.Task) error {
+func (q *RedisQueue) Retry(ctx context.Context, t *model.Task) error {
 	t.Retries++
-	t.Status = task.StatusPending
+	t.Status = model.StatusPending
 	t.UpdatedAt = time.Now()
 
 	data, err := json.Marshal(t)
@@ -90,7 +89,7 @@ func (q *Queue) Retry(ctx context.Context, t *task.Task) error {
 	return nil
 }
 
-func (q *Queue) Pop(ctx context.Context, timeout time.Duration) (*task.Task, error) {
+func (q *RedisQueue) Pop(ctx context.Context, timeout time.Duration) (*model.Task, error) {
 	result, err := q.client.BLPop(ctx, timeout, queueKey).Result()
 	if err != nil {
 		if err == redis.Nil {
@@ -103,7 +102,7 @@ func (q *Queue) Pop(ctx context.Context, timeout time.Duration) (*task.Task, err
 	return q.Get(ctx, taskID)
 }
 
-func (q *Queue) Get(ctx context.Context, id string) (*task.Task, error) {
+func (q *RedisQueue) Get(ctx context.Context, id string) (*model.Task, error) {
 	data, err := q.client.Get(ctx, taskPrefix+id).Bytes()
 	if err != nil {
 		if err == redis.Nil {
@@ -112,7 +111,7 @@ func (q *Queue) Get(ctx context.Context, id string) (*task.Task, error) {
 		return nil, fmt.Errorf("get task: %w", err)
 	}
 
-	var t task.Task
+	var t model.Task
 	if err := json.Unmarshal(data, &t); err != nil {
 		return nil, fmt.Errorf("unmarshal task: %w", err)
 	}
@@ -120,7 +119,7 @@ func (q *Queue) Get(ctx context.Context, id string) (*task.Task, error) {
 	return &t, nil
 }
 
-func (q *Queue) Update(ctx context.Context, t *task.Task) error {
+func (q *RedisQueue) Update(ctx context.Context, t *model.Task) error {
 	t.UpdatedAt = time.Now()
 
 	data, err := json.Marshal(t)
@@ -135,14 +134,14 @@ func (q *Queue) Update(ctx context.Context, t *task.Task) error {
 	return nil
 }
 
-func (q *Queue) List(ctx context.Context) ([]*task.Task, error) {
+func (q *RedisQueue) List(ctx context.Context) ([]*model.Task, error) {
 	keys, err := q.client.Keys(ctx, taskPrefix+"*").Result()
 	if err != nil {
 		return nil, fmt.Errorf("list tasks: %w", err)
 	}
 
 	if len(keys) == 0 {
-		return []*task.Task{}, nil
+		return []*model.Task{}, nil
 	}
 
 	pipe := q.client.Pipeline()
@@ -155,14 +154,14 @@ func (q *Queue) List(ctx context.Context) ([]*task.Task, error) {
 		return nil, fmt.Errorf("fetch tasks: %w", err)
 	}
 
-	tasks := make([]*task.Task, 0, len(keys))
+	tasks := make([]*model.Task, 0, len(keys))
 	for _, cmd := range cmds {
 		data, err := cmd.Bytes()
 		if err != nil {
 			continue
 		}
 
-		var t task.Task
+		var t model.Task
 		if err := json.Unmarshal(data, &t); err != nil {
 			continue
 		}
@@ -172,7 +171,7 @@ func (q *Queue) List(ctx context.Context) ([]*task.Task, error) {
 	return tasks, nil
 }
 
-func (q *Queue) Delete(ctx context.Context, id string) error {
+func (q *RedisQueue) Delete(ctx context.Context, id string) error {
 	if err := q.client.Del(ctx, taskPrefix+id).Err(); err != nil {
 		return fmt.Errorf("delete task: %w", err)
 	}
