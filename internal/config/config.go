@@ -10,6 +10,7 @@ type Config struct {
 	RedisAddr   string
 	RedisPass   string
 	RedisDB     int
+	DBDsn       string
 	WorkerCount int
 }
 
@@ -19,6 +20,7 @@ func Load() *Config {
 		RedisAddr:   getEnv("REDIS_ADDR", "localhost:6379"),
 		RedisPass:   getEnv("REDIS_PASSWORD", ""),
 		RedisDB:     getEnvInt("REDIS_DB", 0),
+		DBDsn:       getEnv("DB_DSN", "host=localhost user=postgres password=postgres dbname=taskqueue sslmode=disable"),
 		WorkerCount: getEnvInt("WORKER_COUNT", 3),
 	}
 }

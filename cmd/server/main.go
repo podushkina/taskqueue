@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"log/slog"
 	"net/http"
 	"os"
@@ -9,11 +10,12 @@ import (
 	"syscall"
 	"time"
 
+	_ "github.com/lib/pq"
 	"github.com/podushkina/taskqueue/internal/api"
 	"github.com/podushkina/taskqueue/internal/config"
-	"github.com/podushkina/taskqueue/internal/handlers"
-	"github.com/podushkina/taskqueue/internal/queue"
+	"github.com/podushkina/taskqueue/internal/repository"
 	"github.com/podushkina/taskqueue/internal/worker"
+	"github.com/podushkina/taskqueue/migrations"
 )
 
 func main() {
@@ -28,32 +30,50 @@ func main() {
 		"redis_addr", cfg.RedisAddr,
 	)
 
-	q, err := queue.New(cfg.RedisAddr, cfg.RedisPass, cfg.RedisDB)
+	db, err := sql.Open("postgres", cfg.DBDsn)
 	if err != nil {
-		logger.Error("Failed to connect to Redis", "error", err)
+		logger.Error("Failed to open Postgres", "error", err)
 		os.Exit(1)
 	}
-	defer func() {
-		if err := q.Close(); err != nil {
-			logger.Error("Error closing Redis", "error", err)
-		}
-	}()
+
+	if err := db.Ping(); err != nil {
+		logger.Error("Failed to ping Postgres", "error", err)
+		_ = db.Close()
+		os.Exit(1)
+	}
+	logger.Info("Connected to PostgreSQL successfully")
+
+	if err := migrations.Run(db); err != nil {
+		logger.Error("Failed to run migrations", "error", err)
+		_ = db.Close()
+		os.Exit(1)
+	}
+	logger.Info("Migrations applied successfully")
+
+	postgresRepo := repository.NewPostgresRepository(db)
+
+	redisQueue, err := repository.NewRedisQueue(cfg.RedisAddr, cfg.RedisPass, cfg.RedisDB)
+	if err != nil {
+		logger.Error("Failed to connect to Redis", "error", err)
+		_ = db.Close()
+		os.Exit(1)
+	}
 	logger.Info("Connected to Redis successfully")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	pool := worker.NewPool(q, cfg.WorkerCount)
+	pool := worker.NewPool(redisQueue, postgresRepo, cfg.WorkerCount)
 
-	pool.Register("echo", handlers.Echo)
-	pool.Register("reverse", handlers.Reverse)
-	pool.Register("sum", handlers.Sum)
-	pool.Register("slow", handlers.Slow)
-	pool.Register("flaky", handlers.Flaky)
+	pool.Register("echo", worker.Echo)
+	pool.Register("reverse", worker.Reverse)
+	pool.Register("sum", worker.Sum)
+	pool.Register("slow", worker.Slow)
+	pool.Register("flaky", worker.Flaky)
 
 	pool.Start(ctx)
 
-	handler := api.NewHandler(q)
+	handler := api.NewHandler(redisQueue)
 	router := api.NewRouter(handler)
 
 	server := &http.Server{
@@ -78,16 +98,28 @@ func main() {
 	sig := <-quit
 	logger.Info("Shutdown signal received", "signal", sig.String())
 
-	cancel()
-
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer shutdownCancel()
-
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		logger.Error("Server shutdown error", "error", err)
 	}
+	shutdownCancel()
+	logger.Info("HTTP server stopped")
 
+	cancel()
 	pool.Stop()
+
+	logger.Info("Closing storage connections...")
+	if err := redisQueue.Close(); err != nil {
+		logger.Error("Error closing Redis cleanly", "error", err)
+	} else {
+		logger.Info("Redis connection closed successfully")
+	}
+
+	if err := db.Close(); err != nil {
+		logger.Error("Error closing Postgres cleanly", "error", err)
+	} else {
+		logger.Info("PostgreSQL connection closed successfully")
+	}
 
 	logger.Info("Server stopped gracefully")
 }
