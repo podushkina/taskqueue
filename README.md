@@ -250,7 +250,7 @@ taskqueue/
 │   ├── api/
 │   │   ├── handler.go        # HTTP хендлеры
 │   │   ├── handler_test.go
-│   │   └── router.go         # Роутер chi и middleware
+│   │   └── router.go         # Роутер chi 
 │   ├── config/
 │   │   └── config.go         # Парсинг переменных окружения
 │   ├── model/
