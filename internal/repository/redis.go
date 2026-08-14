@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/podushkina/taskqueue/internal/metrics"
 	"github.com/podushkina/taskqueue/internal/model"
 	"github.com/redis/go-redis/v9"
 )
@@ -176,4 +177,26 @@ func (q *RedisQueue) Delete(ctx context.Context, id string) error {
 		return fmt.Errorf("delete task: %w", err)
 	}
 	return nil
+}
+
+func (q *RedisQueue) StartQueueDepthCollector(ctx context.Context, m *metrics.Metrics, interval time.Duration) {
+	if m == nil {
+		return
+	}
+
+	ticker := time.NewTicker(interval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				length, err := q.client.LLen(ctx, queueKey).Result()
+				if err == nil {
+					m.QueueDepth.WithLabelValues("default").Set(float64(length))
+				}
+			}
+		}
+	}()
 }
