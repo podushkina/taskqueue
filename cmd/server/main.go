@@ -78,7 +78,8 @@ func main() {
 
 	pool.Start(ctx)
 
-	handler := api.NewHandler(redisQueue)
+	// Передаем redisQueue и postgresRepo (как поставщика аналитики)
+	handler := api.NewHandler(redisQueue, postgresRepo)
 	router := api.NewRouter(handler, m)
 
 	server := &http.Server{
