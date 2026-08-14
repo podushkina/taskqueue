@@ -13,6 +13,7 @@ import (
 	_ "github.com/lib/pq"
 	"github.com/podushkina/taskqueue/internal/api"
 	"github.com/podushkina/taskqueue/internal/config"
+	"github.com/podushkina/taskqueue/internal/metrics"
 	"github.com/podushkina/taskqueue/internal/repository"
 	"github.com/podushkina/taskqueue/internal/worker"
 	"github.com/podushkina/taskqueue/migrations"
@@ -60,10 +61,14 @@ func main() {
 	}
 	logger.Info("Connected to Redis successfully")
 
+	m := metrics.NewMetrics()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	pool := worker.NewPool(redisQueue, postgresRepo, cfg.WorkerCount)
+	redisQueue.StartQueueDepthCollector(ctx, m, 2*time.Second)
+
+	pool := worker.NewPool(redisQueue, postgresRepo, m, cfg.WorkerCount)
 
 	pool.Register("echo", worker.Echo)
 	pool.Register("reverse", worker.Reverse)
@@ -74,7 +79,7 @@ func main() {
 	pool.Start(ctx)
 
 	handler := api.NewHandler(redisQueue)
-	router := api.NewRouter(handler)
+	router := api.NewRouter(handler, m)
 
 	server := &http.Server{
 		Addr:         ":" + cfg.ServerPort,
