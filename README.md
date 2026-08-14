@@ -1,4 +1,4 @@
-# 🚀 Distributed Task Queue
+# Distributed Task Queue
 
 ![Go](https://img.shields.io/badge/Go-1.23-00ADD8?style=flat&logo=go)
 ![Redis](https://img.shields.io/badge/Redis-7.0-DC382D?style=flat&logo=redis)
@@ -8,29 +8,30 @@
 ![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?style=flat&logo=docker)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
-Асинхронная распределённая очередь задач на **Go**, использующая **Redis** как брокер сообщений и **PostgreSQL** для надёжного хранения истории выполнения и операционной аналитики.
+Асинхронная распределенная очередь задач на Go с брокером на Redis и хранилищем истории в PostgreSQL.
 
-Сервис спроектирован с упором на отказоустойчивость и наблюдаемость: внедрены паттерны **Worker Pool**, **Panic Recovery**, **Non-blocking Exponential Backoff**, сбор **RED-метрик** в **Prometheus**, преднастроенные дашборды в **Grafana** и автоматические миграции схемы БД через **Goose**.
-
----
-
-## 📖 Содержание
-
-- [Архитектура](#-архитектура)
-- [Ключевые особенности](#-ключевые-особенности)
-- [Мониторинг и Observability](#-мониторинг-и-observability)
-- [Технологический стек](#-технологический-стек)
-- [Быстрый старт](#-быстрый-старт)
-- [API](#-api)
-- [Типы задач](#-типы-задач)
-- [Retry & Failure Isolation](#-retry--failure-isolation)
-- [Структура проекта](#-структура-проекта)
-- [Тесты](#-тесты)
-- [Конфигурация](#-конфигурация)
+Проект включает пул воркеров, неблокирующий экспоненциальный retry, сохранение истории и аналитику в PostgreSQL, сбор RED-метрик для Prometheus и преднастроенный дашборд в Grafana.
 
 ---
 
-## 🏗 Архитектура
+## Содержание
+
+- [Архитектура](#архитектура)
+- [Реализованные механизмы](#реализованные-механизмы)
+- [Мониторинг и Observability](#мониторинг-и-observability)
+- [Технологический стек](#технологический-стек)
+- [Запуск](#запуск)
+- [API](#api)
+- [Типы задач](#типы-задач)
+- [Жизненный цикл задачи](#жизненный-цикл-задачи)
+- [Структура проекта](#структура-проекта)
+- [Тесты](#тесты)
+- [Конфигурация](#конфигурация)
+- [Лицензия](#лицензия)
+
+---
+
+## Архитектура
 
 ```
 ┌──────────────┐        ┌──────────────────────────┐        ┌──────────────┐
@@ -51,63 +52,61 @@
 └──────────────────┘                                        └──────────────┘
 ```
 
-1. **API Server (`chi`)** — принимает HTTP-запросы, отдаёт аналитику, экспортирует RED-метрики для Prometheus и ставит задачи в Redis через абстрактный интерфейс `TaskEnqueuer`.
-2. **Redis Queue** — персистентный брокер сообщений для оперативного управления очередью (хранение тасок, списков и удаление).
-3. **Worker Pool** — пул изолированных горутин с защитой от паник (`recover()`), вычитывающих задачи из Redis.
-4. **PostgreSQL Repository** — слой хранения истории выполнения с составным B-Tree индексом для мгновенной агрегированной аналитики.
+1. **API Server (`chi`)**: принимает запросы, ставит задачи в Redis, отдает историю/аналитику и экспортирует метрики на `/metrics`.
+2. **Redis Queue**: хранит списки задач (`LPUSH`, `RPOP`) и их текущие состояния.
+3. **Worker Pool**: набор горутин, вычитывающих задачи из брокера. Включает перехват паник (`recover`) и Graceful Shutdown.
+4. **PostgreSQL Repository**: сохраняет историю выполненных задач. Схема содержит составной B-Tree индекс для агрегации аналитики.
 
 ---
 
-## ✨ Ключевые особенности
+## Реализованные механизмы
 
-### 🛡️ Reliability & Failure Isolation (Надёжность)
-- **Panic Recovery** — паника внутри пользовательского обработчика задачи изолируется на уровне воркера; пул горутин продолжает функционировать, а задача корректно помечается как `failed`.
-- **Non-blocking Retries** — повторные попытки выполняются неблокирующим таймером (`time.NewTimer`) с `select` и мгновенной реакцией на отмену `context.Context`.
-- **Exponential Backoff** — интервал ожидания между попытками растёт прогрессивно: `1s → 2s → 4s`.
-- **Dead Letter Logic (DLQ)** — по достижении лимита повторов (`max_retries`) задача окончательно переводится в терминальный статус `failed`.
+### Обработка ошибок и надежность
+- **Panic Recovery**: если обработчик задачи падает с паникой, воркер перехватывает ее через `recover()`, пул продолжает работу, а задача получает статус `failed`.
+- **Non-blocking Retries**: пауза перед повторной попыткой реализована через `time.NewTimer` с `select`, что дает возможность мгновенно остановить воркер при отмене контекста.
+- **Exponential Backoff**: интервал ожидания между попытками растет: `1s → 2s → 4s`. При исчерпании лимита (`max_retry`) задача переходит в статус `failed`.
 
-### ⚡ PostgreSQL Performance & Analytics
-- **Composite B-Tree Index** — миграция схемы создает индекс `idx_task_history_status_created_at` `(status, created_at DESC)` для исключения Full Table Scan и ускорения выборки.
-- **Single-Query Aggregation** — эндпоинт `/analytics` выгружает сводное распределение по статусам и среднее время выполнения задач за один эффективный SQL-запрос.
+### Работа с базой данных
+- **Composite B-Tree Index**: индекс `(status, created_at DESC)` в таблице `task_history` исключает Full Table Scan при выборке истории.
+- **Single-Query Aggregation**: ручка `/analytics` рассчитывает статистику по статусам и среднюю длительность задач за один агрегационный SQL-запрос.
 
-### 📊 Observability (Наблюдаемость)
-- **RED Metrics (Rate, Errors, Duration)** — сбор RPS, кодов ответа, перцентилей задержек выполнения задач (p50, p90, p99), глубины очереди Redis и активных воркеров.
-- **Grafana Provisioning** — автоматическое подключение Prometheus и готового дашборда при старте Docker-контейнеров.
-- **Structured Logging** — структурированные JSON-логи через стандартный пакет `log/slog` с метаданными `task_id` и `worker_id`.
+### Метрики и логирование
+- **RED Metrics**: HTTP-middleware фиксирует частоту запросов (Rate), ошибки (Errors) и гистограммы длительности обработки задач (Duration). Воркеры экспортируют глубину очереди и счетчики ретраев.
+- **Structured Logging**: логирование в формате JSON через `log/slog` с полями `task_id` и `worker_id`.
 
 ---
 
-## 📊 Мониторинг и Observability
+## Мониторинг и Observability
 
-Стек мониторинга разворачивается автоматически в едином `docker-compose.yml`:
+Стек мониторинга разворачивается в `docker-compose.yml`:
 * **Prometheus:** `http://localhost:9090`
-* **Grafana Dashboard:** `http://localhost:3000` (анонимный вход включен по умолчанию)
+* **Grafana:** `http://localhost:3000` (анонимный доступ включен)
 * **Метрики приложения:** `http://localhost:8080/metrics`
 
 ![Grafana Dashboard](docs/images/grafana-dashboard.png)
 
 ---
 
-## 🛠 Технологический стек
+## Технологический стек
 
 | Категория | Технология |
 |---|---|
 | Язык | Go 1.23+ |
-| Брокер очередей | Redis 7 (go-redis/v9) |
+| Брокер очередей | Redis 7 (`go-redis/v9`) |
 | База данных | PostgreSQL 15 |
-| Миграции | Goose v3 (с поддержкой `go:embed`) |
-| Мониторинг | Prometheus + Grafana (Dashboard Provisioning) |
+| Миграции | Goose v3 (`go:embed`) |
+| Мониторинг | Prometheus + Grafana |
 | HTTP роутер | Chi v5 |
-| Конфигурация | Переменные окружения (12-Factor App) |
-| Тесты | `testing` + `testify` + интеграционные тесты БД |
-| Контейнеризация | Docker, Docker Compose (с healthchecks) |
-| Логирование | `log/slog` (structured JSON) |
+| Конфигурация | Переменные окружения |
+| Тесты | `testing`, `testify`, интеграционные тесты |
+| Контейнеризация | Docker, Docker Compose |
+| Логирование | `log/slog` |
 
 ---
 
-## ⚡ Быстрый старт
+## Запуск
 
-### Запуск через Docker Compose (все сервисы + мониторинг)
+### Запуск через Docker Compose
 
 ```bash
 git clone [https://github.com/podushkina/taskqueue.git](https://github.com/podushkina/taskqueue.git)
@@ -115,24 +114,24 @@ cd taskqueue
 make up
 ```
 
-> После запуска будут доступны:
-> * **API:** `http://localhost:8080`
-> * **Grafana:** `http://localhost:3000`
-> * **Prometheus:** `http://localhost:9090`
+После старта доступны:
+* API: `http://localhost:8080`
+* Grafana: `http://localhost:3000`
+* Prometheus: `http://localhost:9090`
 
-### Локальный запуск для разработки
+### Локальный запуск
 
 ```bash
-# 1. Поднять инфраструктуру в фоне
+# 1. Запустить базы и мониторинг в фоне
 docker compose up -d redis postgres prometheus grafana
 
-# 2. Запустить сервис локально
+# 2. Запустить сервер
 go run ./cmd/server
 ```
 
 ---
 
-## 📚 API
+## API
 
 ### 1. Создать задачу
 
@@ -183,7 +182,7 @@ curl http://localhost:8080/tasks/ebe2fdf7-09b4-4cae-a994-1a659757e739
 ### 3. Операционная аналитика
 
 **`GET /analytics`**  
-*(Опциональные query-параметры фильтрации: `from`, `to` в формате RFC3339)*
+Параметры фильтрации `from` и `to` опциональны (формат RFC3339).
 
 ```bash
 curl "http://localhost:8080/analytics?from=2026-08-14T00:00:00Z&to=2026-08-14T23:59:59Z"
@@ -203,7 +202,7 @@ curl "http://localhost:8080/analytics?from=2026-08-14T00:00:00Z&to=2026-08-14T23
 }
 ```
 
-### 4. Список всех активных задач
+### 4. Список задач в очереди
 
 **`GET /tasks`**
 
@@ -232,21 +231,19 @@ curl http://localhost:8080/health
 
 ---
 
-## 🎯 Типы задач
+## Типы задач
 
-| Тип | Описание | Пример Payload | Пример Result |
+| Тип | Описание | Пример Payload | Результат |
 |---|---|---|---|
 | `echo` | Возвращает переданный payload | `"Hello"` | `"echo: Hello"` |
-| `reverse` | Переворачивает строку | `"Hello"` | `"olleH"` |
+| `reverse` | Переворачивает строку | `"golang"` | `"gnalog"` |
 | `sum` | Суммирует числа через запятую | `"10,20,30"` | `"60.00"` |
-| `slow` | Имитация долгой работы (5 сек) | любой | `"completed after 5 seconds"` |
-| `flaky` | Имитация нестабильной работы (демо retry) | любой | Результат или ошибка |
+| `slow` | Имитация длительной операции (5 сек) | любой | `"completed after 5 seconds"` |
+| `flaky` | Имитация нестабильной работы для тестов | любой | Результат или ошибка |
 
 ---
 
-## 🔄 Retry & Failure Isolation
-
-Жизненный цикл задачи:
+## Жизненный цикл задачи
 
 ```
                   ┌───────────────────────────────┐
@@ -269,7 +266,7 @@ curl http://localhost:8080/health
 
 ---
 
-## 📂 Структура проекта
+## Структура проекта
 
 ```
 taskqueue/
@@ -278,51 +275,51 @@ taskqueue/
 │       └── main.go                 # Точка входа, DI, Graceful Shutdown
 ├── grafana/
 │   └── provisioning/
-│       ├── dashboards/             # JSON-схема дашборда и авто-провижининг
-│       └── datasources/            # Авто-подключение Prometheus
+│       ├── dashboards/             # Конфигурация дашборда
+│       └── datasources/            # Подключение Prometheus
 ├── internal/
 │   ├── api/
-│   │   ├── handler.go              # HTTP-хендлеры 
+│   │   ├── handler.go              # HTTP-хендлеры
 │   │   ├── handler_test.go         # Unit-тесты ручек
-│   │   ├── middleware.go           # Middleware сбора RED-метрик
-│   │   └── router.go               # Роутер chi и подключение /metrics
+│   │   ├── middleware.go           # Сбор RED-метрик
+│   │   └── router.go               # Роутинг и эндпоинт /metrics
 │   ├── config/
-│   │   └── config.go               # Загрузка env-конфигурации
+│   │   └── config.go               # Чтение конфигурации
 │   ├── metrics/
-│   │   └── prometheus.go           # Регистрация Prometheus метрик
+│   │   └── prometheus.go           # Prometheus метрики
 │   ├── model/
-│   │   ├── analytics.go            # DTO агрегированной аналитики
-│   │   └── task.go                 # Структура Task и статусы
+│   │   ├── analytics.go            # Модель аналитики
+│   │   └── task.go                 # Модель Task
 │   ├── repository/
-│   │   ├── postgres.go             # PostgreSQL репозиторий (History & Analytics)
+│   │   ├── postgres.go             # Слой работы с PostgreSQL
 │   │   ├── postgres_test.go        # Интеграционные тесты БД
-│   │   ├── redis.go                # Redis брокер очереди
+│   │   ├── redis.go                # Слой работы с Redis
 │   │   └── redis_test.go           # Интеграционные тесты Redis
 │   └── worker/
 │       ├── jobs.go                 # Обработчики типов задач
 │       ├── pool.go                 # Worker Pool, Panic Recovery, Backoff
-│       └── pool_test.go            # Тесты конкурентности и отмены контекстов
+│       └── pool_test.go            # Тесты пула воркеров
 ├── migrations/
-│   ├── 00001_init_tasks.sql        # Создание таблицы task_history
-│   ├── 00002_add_status_index.sql  # Составной B-Tree индекс
-│   └── migrations.go               # Goose runner (go:embed)
-├── docker-compose.yml              # Полный стек (App, Redis, PG, Prom, Grafana)
-├── Dockerfile                      # Multi-stage сборка легковесного образа
-├── Makefile                        # Команды сборки, тестов и запуска
-└── prometheus.yml                  # Конфигурация скрайпинга метрик
+│   ├── 00001_init_tasks.sql        # Схема таблицы task_history
+│   ├── 00002_add_status_index.sql  # Составной индекс
+│   └── migrations.go               # Запуск Goose миграций (go:embed)
+├── docker-compose.yml
+├── Dockerfile
+├── Makefile
+└── prometheus.yml
 ```
 
 ---
 
-## 🧪 Тесты
+## Тесты
 
-Запуск полного набора unit- и интеграционных тестов с автоматической подстановкой DSN:
+Запуск тестов:
 
 ```bash
 make test
 ```
 
-С проверкой на состояние гонок данных:
+Запуск с race detector:
 
 ```bash
 go test -race -v ./...
@@ -330,20 +327,20 @@ go test -race -v ./...
 
 ---
 
-## ⚙️ Конфигурация
+## Конфигурация
 
-| Переменная | Описание | Значение по умолчанию |
+| Переменная | Описание | По умолчанию |
 |---|---|---|
 | `SERVER_PORT` | Порт HTTP API | `8080` |
-| `DB_DSN` | Подключение к PostgreSQL | `host=postgres user=postgres password=postgres dbname=taskqueue sslmode=disable` |
+| `DB_DSN` | Строка подключения к PostgreSQL | `host=postgres user=postgres password=postgres dbname=taskqueue sslmode=disable` |
 | `REDIS_ADDR` | Адрес Redis | `redis:6379` |
 | `REDIS_PASSWORD` | Пароль Redis | _(пусто)_ |
 | `REDIS_DB` | База данных Redis | `0` |
-| `WORKER_COUNT` | Количество горутин в пуле | `3` |
-| `SHUTDOWN_TIMEOUT` | Тайм-аут на Graceful Shutdown | `10s` |
+| `WORKER_COUNT` | Количество воркеров в пуле | `3` |
+| `SHUTDOWN_TIMEOUT` | Таймаут Graceful Shutdown | `10s` |
 
 ---
 
-## 📄 Лицензия
+## Лицензия
 
-Этот проект распространяется под лицензией [MIT](LICENSE).
+Проект распространяется под лицензией [MIT](LICENSE).
