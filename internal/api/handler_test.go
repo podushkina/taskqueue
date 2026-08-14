@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/podushkina/taskqueue/internal/model"
@@ -55,9 +56,21 @@ func (m *mockFullEnqueuer) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
+type mockAnalyticsProvider struct {
+	summary    *model.AnalyticsSummary
+	errToThrow error
+}
+
+func (m *mockAnalyticsProvider) GetAnalytics(ctx context.Context, from, to time.Time) (*model.AnalyticsSummary, error) {
+	if m.errToThrow != nil {
+		return nil, m.errToThrow
+	}
+	return m.summary, nil
+}
+
 func TestCreateTask_Success(t *testing.T) {
 	me := &mockFullEnqueuer{tasks: make(map[string]*model.Task)}
-	h := NewHandler(me)
+	h := NewHandler(me, nil)
 
 	body, _ := json.Marshal(map[string]string{"type": "echo", "payload": "test"})
 	req, _ := http.NewRequest("POST", "/tasks", bytes.NewBuffer(body))
@@ -75,7 +88,7 @@ func TestCreateTask_Success(t *testing.T) {
 
 func TestCreateTask_MissingType(t *testing.T) {
 	me := &mockFullEnqueuer{tasks: make(map[string]*model.Task)}
-	h := NewHandler(me)
+	h := NewHandler(me, nil)
 
 	body, _ := json.Marshal(map[string]string{"payload": "test"})
 	req, _ := http.NewRequest("POST", "/tasks", bytes.NewBuffer(body))
@@ -88,7 +101,7 @@ func TestCreateTask_MissingType(t *testing.T) {
 
 func TestCreateTask_InvalidJSON(t *testing.T) {
 	me := &mockFullEnqueuer{tasks: make(map[string]*model.Task)}
-	h := NewHandler(me)
+	h := NewHandler(me, nil)
 
 	req, _ := http.NewRequest("POST", "/tasks", bytes.NewBuffer([]byte(`{"type":`)))
 	rr := httptest.NewRecorder()
@@ -100,7 +113,7 @@ func TestCreateTask_InvalidJSON(t *testing.T) {
 
 func TestCreateTask_QueueError(t *testing.T) {
 	me := &mockFullEnqueuer{tasks: make(map[string]*model.Task), errToThrow: errors.New("redis err")}
-	h := NewHandler(me)
+	h := NewHandler(me, nil)
 
 	body, _ := json.Marshal(map[string]string{"type": "echo", "payload": "test"})
 	req, _ := http.NewRequest("POST", "/tasks", bytes.NewBuffer(body))
@@ -115,7 +128,7 @@ func TestGetTask_Success(t *testing.T) {
 	me := &mockFullEnqueuer{tasks: map[string]*model.Task{
 		"111": {ID: "111", Type: "echo", Status: model.StatusPending},
 	}}
-	h := NewHandler(me)
+	h := NewHandler(me, nil)
 
 	req, _ := http.NewRequest("GET", "/tasks/111", nil)
 	chiCtx := chi.NewRouteContext()
@@ -133,7 +146,7 @@ func TestGetTask_Success(t *testing.T) {
 
 func TestGetTask_NotFound(t *testing.T) {
 	me := &mockFullEnqueuer{tasks: make(map[string]*model.Task)}
-	h := NewHandler(me)
+	h := NewHandler(me, nil)
 
 	req, _ := http.NewRequest("GET", "/tasks/999", nil)
 	chiCtx := chi.NewRouteContext()
@@ -148,7 +161,7 @@ func TestGetTask_NotFound(t *testing.T) {
 
 func TestGetTask_QueueError(t *testing.T) {
 	me := &mockFullEnqueuer{tasks: make(map[string]*model.Task), errToThrow: errors.New("err")}
-	h := NewHandler(me)
+	h := NewHandler(me, nil)
 
 	req, _ := http.NewRequest("GET", "/tasks/111", nil)
 	chiCtx := chi.NewRouteContext()
@@ -166,7 +179,7 @@ func TestListTasks_Success(t *testing.T) {
 		"1": {ID: "1"},
 		"2": {ID: "2"},
 	}}
-	h := NewHandler(me)
+	h := NewHandler(me, nil)
 
 	req, _ := http.NewRequest("GET", "/tasks", nil)
 	rr := httptest.NewRecorder()
@@ -183,7 +196,7 @@ func TestDeleteTask_Success(t *testing.T) {
 	me := &mockFullEnqueuer{tasks: map[string]*model.Task{
 		"del": {ID: "del"},
 	}}
-	h := NewHandler(me)
+	h := NewHandler(me, nil)
 
 	req, _ := http.NewRequest("DELETE", "/tasks/del", nil)
 	chiCtx := chi.NewRouteContext()
@@ -199,7 +212,7 @@ func TestDeleteTask_Success(t *testing.T) {
 
 func TestDeleteTask_NotFound(t *testing.T) {
 	me := &mockFullEnqueuer{tasks: make(map[string]*model.Task)}
-	h := NewHandler(me)
+	h := NewHandler(me, nil)
 
 	req, _ := http.NewRequest("DELETE", "/tasks/999", nil)
 	chiCtx := chi.NewRouteContext()
@@ -212,8 +225,48 @@ func TestDeleteTask_NotFound(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, rr.Code)
 }
 
+func TestGetAnalytics_Success(t *testing.T) {
+	mockAnalytics := &mockAnalyticsProvider{
+		summary: &model.AnalyticsSummary{
+			TotalTasks: 5,
+			StatusCounts: map[string]int64{
+				"completed": 4,
+				"failed":    1,
+			},
+			AvgDurationSecs: 1.25,
+		},
+	}
+	h := NewHandler(&mockFullEnqueuer{}, mockAnalytics)
+
+	req, _ := http.NewRequest("GET", "/analytics?from=2026-08-14T00:00:00Z&to=2026-08-14T23:59:59Z", nil)
+	rr := httptest.NewRecorder()
+
+	h.GetAnalytics(rr, req)
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+	var summary model.AnalyticsSummary
+	err := json.Unmarshal(rr.Body.Bytes(), &summary)
+	require.NoError(t, err)
+	assert.Equal(t, int64(5), summary.TotalTasks)
+	assert.Equal(t, 1.25, summary.AvgDurationSecs)
+}
+
+func TestGetAnalytics_InternalError(t *testing.T) {
+	mockAnalytics := &mockAnalyticsProvider{
+		errToThrow: errors.New("db query failed"),
+	}
+	h := NewHandler(&mockFullEnqueuer{}, mockAnalytics)
+
+	req, _ := http.NewRequest("GET", "/analytics", nil)
+	rr := httptest.NewRecorder()
+
+	h.GetAnalytics(rr, req)
+
+	assert.Equal(t, http.StatusInternalServerError, rr.Code)
+}
+
 func TestHealthCheck(t *testing.T) {
-	h := NewHandler(&mockFullEnqueuer{})
+	h := NewHandler(&mockFullEnqueuer{}, nil)
 	req, _ := http.NewRequest("GET", "/health", nil)
 	rr := httptest.NewRecorder()
 

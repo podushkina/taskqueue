@@ -4,12 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/podushkina/taskqueue/internal/model"
 )
 
-// Уникальный интерфейс для API — только методы для веб-ручек
 type TaskEnqueuer interface {
 	Push(ctx context.Context, taskType, payload string) (*model.Task, error)
 	Get(ctx context.Context, id string) (*model.Task, error)
@@ -17,12 +17,20 @@ type TaskEnqueuer interface {
 	Delete(ctx context.Context, id string) error
 }
 
-type Handler struct {
-	queue TaskEnqueuer
+type AnalyticsProvider interface {
+	GetAnalytics(ctx context.Context, from, to time.Time) (*model.AnalyticsSummary, error)
 }
 
-func NewHandler(q TaskEnqueuer) *Handler {
-	return &Handler{queue: q}
+type Handler struct {
+	queue     TaskEnqueuer
+	analytics AnalyticsProvider
+}
+
+func NewHandler(q TaskEnqueuer, a AnalyticsProvider) *Handler {
+	return &Handler{
+		queue:     q,
+		analytics: a,
+	}
 }
 
 type CreateTaskRequest struct {
@@ -102,6 +110,35 @@ func (h *Handler) DeleteTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) GetAnalytics(w http.ResponseWriter, r *http.Request) {
+	if h.analytics == nil {
+		respondError(w, http.StatusNotImplemented, "analytics provider is not configured")
+		return
+	}
+
+	to := time.Now()
+	from := to.Add(-24 * time.Hour)
+
+	if fromParam := r.URL.Query().Get("from"); fromParam != "" {
+		if t, err := time.Parse(time.RFC3339, fromParam); err == nil {
+			from = t
+		}
+	}
+	if toParam := r.URL.Query().Get("to"); toParam != "" {
+		if t, err := time.Parse(time.RFC3339, toParam); err == nil {
+			to = t
+		}
+	}
+
+	summary, err := h.analytics.GetAnalytics(r.Context(), from, to)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	respondJSON(w, http.StatusOK, summary)
 }
 
 func (h *Handler) HealthCheck(w http.ResponseWriter, r *http.Request) {

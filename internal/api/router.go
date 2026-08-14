@@ -16,6 +16,7 @@ func NewRouter(h *Handler, m HTTPMetricsRecorder) *chi.Mux {
 
 	r.Handle("/metrics", promhttp.Handler())
 	r.Get("/health", h.HealthCheck)
+	r.Get("/analytics", h.GetAnalytics)
 
 	r.Route("/tasks", func(r chi.Router) {
 		r.Post("/", h.CreateTask)
